@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -148,7 +149,7 @@ class DeepseekMoeSparseMoeBlock(nn.Module):
             # dynamic MoE execution.
             token_mask = topk_idx == expert_id
             token_indices, slot_indices = torch.where(token_mask)
-            if token_indices.numel() == 0:
+            if guard_or_false(token_indices.numel() == 0):
                 continue
 
             expert_input = flat_states.index_select(0, token_indices)
