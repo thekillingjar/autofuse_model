@@ -147,11 +147,11 @@ class DeepseekMoeSparseMoeBlock(nn.Module):
             [torch.cat((expert.gate_proj.weight, expert.up_proj.weight), dim=0)
              for expert in self.experts],
             dim=0,
-        )
+        ).transpose(1, 2).contiguous()
         down_weight = torch.stack(
             [expert.down_proj.weight for expert in self.experts],
             dim=0,
-        )
+        ).transpose(1, 2).contiguous()
         gate_up = torch_npu.npu_grouped_matmul(
             [hidden_states],
             [gate_up_weight],
