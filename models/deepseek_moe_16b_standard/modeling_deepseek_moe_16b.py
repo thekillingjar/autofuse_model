@@ -142,12 +142,19 @@ class DeepseekMoeSparseMoeBlock(nn.Module):
         topk_idx, topk_weight = self.gate(flat_states)
         output = torch.zeros_like(flat_states)
         for expert_id, expert in enumerate(self.experts):
-            expert_weight = torch.where(
-                topk_idx == expert_id,
-                topk_weight,
-                torch.zeros_like(topk_weight),
-            ).sum(dim=-1, keepdim=True)
-            output = output + expert(flat_states) * expert_weight
+            # Dispatch only the tokens selected by this expert.  The previous
+            # implementation evaluated every expert for every token and then
+            # masked the result, which was mathematically routed but not a
+            # dynamic MoE execution.
+            token_mask = topk_idx == expert_id
+            token_indices, slot_indices = torch.where(token_mask)
+            if token_indices.numel() == 0:
+                continue
+
+            expert_input = flat_states.index_select(0, token_indices)
+            expert_output = expert(expert_input)
+            expert_output = expert_output * topk_weight[token_indices, slot_indices].unsqueeze(-1)
+            output.index_add_(0, token_indices, expert_output)
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat_states)
         return output.reshape(original_shape)
