@@ -11,7 +11,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.fx.experimental.symbolic_shapes import guard_or_false
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -137,25 +136,75 @@ class DeepseekMoeSparseMoeBlock(nn.Module):
                 * config.n_shared_experts,
             )
 
+    def _grouped_experts(self, hidden_states, tokens_per_expert):
+        """Run all routed experts through NPU grouped matmul kernels."""
+        try:
+            import torch_npu
+        except ImportError as exc:
+            raise RuntimeError("Dynamic MoE execution requires torch_npu") from exc
+
+        gate_up_weight = torch.stack(
+            [torch.cat((expert.gate_proj.weight, expert.up_proj.weight), dim=0)
+             for expert in self.experts],
+            dim=0,
+        )
+        down_weight = torch.stack(
+            [expert.down_proj.weight for expert in self.experts],
+            dim=0,
+        )
+        gate_up = torch_npu.npu_grouped_matmul(
+            [hidden_states],
+            [gate_up_weight],
+            group_list=tokens_per_expert,
+            split_item=3,
+            group_type=0,
+            group_list_type=1,
+            output_dtype=hidden_states.dtype,
+            tuning_config=[0],
+        )[0]
+        intermediate_size = self.experts[0].gate_proj.out_features
+        gate, up = gate_up.split(intermediate_size, dim=-1)
+        activated = F.silu(gate) * up
+        return torch_npu.npu_grouped_matmul(
+            [activated],
+            [down_weight],
+            group_list=tokens_per_expert,
+            split_item=3,
+            group_type=0,
+            group_list_type=1,
+            output_dtype=hidden_states.dtype,
+            tuning_config=[0],
+        )[0]
+
     def forward(self, hidden_states):
         original_shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, original_shape[-1])
         topk_idx, topk_weight = self.gate(flat_states)
-        output = torch.zeros_like(flat_states)
-        for expert_id, expert in enumerate(self.experts):
-            # Dispatch only the tokens selected by this expert.  The previous
-            # implementation evaluated every expert for every token and then
-            # masked the result, which was mathematically routed but not a
-            # dynamic MoE execution.
-            token_mask = topk_idx == expert_id
-            token_indices, slot_indices = torch.where(token_mask)
-            if guard_or_false(token_indices.numel() == 0):
-                continue
+        import torch_npu
 
-            expert_input = flat_states.index_select(0, token_indices)
-            expert_output = expert(expert_input)
-            expert_output = expert_output * topk_weight[token_indices, slot_indices].unsqueeze(-1)
-            output.index_add_(0, token_indices, expert_output)
+        expanded_states, expanded_row_idx, tokens_per_expert, _ = (
+            torch_npu.npu_moe_init_routing_v2(
+                flat_states,
+                expert_idx=topk_idx.to(torch.int32),
+                active_num=topk_idx.shape[0] * topk_idx.shape[1],
+                expert_num=self.gate.n_routed_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, self.gate.n_routed_experts],
+                quant_mode=-1,
+            )
+        )
+        expert_output = self._grouped_experts(expanded_states, tokens_per_expert)
+        output = torch_npu.npu_moe_finalize_routing(
+            expert_output,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weight.to(expert_output.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2,
+        )
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat_states)
         return output.reshape(original_shape)

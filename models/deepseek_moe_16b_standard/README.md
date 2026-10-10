@@ -39,7 +39,7 @@ python3 -m models.deepseek_moe_16b_standard.compare_autofuse \
   --steps 1
 ```
 
-The MoE block uses a fixed-graph PyTorch implementation that computes every
-routed expert and masks by top-k router weights. This keeps fullgraph compile
-simple and avoids custom sparse MoE kernels, but it is not a production sparse
-MoE performance implementation.
+The MoE block uses the NPU dynamic routing path:
+`npu_moe_init_routing_v2` -> `npu_grouped_matmul` ->
+`npu_moe_finalize_routing`. Expert selection and per-expert token counts are
+dynamic, while the routing interface remains fixed for compiled execution.
