@@ -3,74 +3,62 @@
 
 from __future__ import annotations
 
-from transformers.configuration_utils import PretrainedConfig
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 
-class DeepseekMoeConfig(PretrainedConfig):
-    model_type = "deepseek"
+@dataclass
+class DeepseekConfig:
+    """DeepSeek-MoE config, defaulting to deepseek-moe-16b-base shapes."""
 
-    def __init__(
-        self,
-        vocab_size=102400,
-        hidden_size=2048,
-        intermediate_size=10944,
-        moe_intermediate_size=1408,
-        num_hidden_layers=28,
-        num_attention_heads=16,
-        num_key_value_heads=16,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=100000,
-        eos_token_id=100001,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        attention_bias=False,
-        scoring_func="softmax",
-        num_experts_per_tok=6,
-        n_routed_experts=64,
-        n_shared_experts=2,
-        routed_scaling_factor=1.0,
-        first_k_dense_replace=1,
-        norm_topk_prob=False,
-        aux_loss_alpha=0.001,
-        seq_aux=True,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.attention_bias = attention_bias
-        self.scoring_func = scoring_func
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.routed_scaling_factor = routed_scaling_factor
-        self.first_k_dense_replace = first_k_dense_replace
-        self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        self.head_dim = hidden_size // num_attention_heads
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+    vocab_size: int = 102400
+    hidden_size: int = 2048
+    intermediate_size: int = 1096
+    moe_intermediate_size: int = 2816
+    num_hidden_layers: int = 27
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 16
+    n_routed_experts: int = 64
+    num_experts_per_tok: int = 6
+    n_shared_experts: int = 2
+    first_k_dense_replace: int = 1
+    max_position_embeddings: int = 4096
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    tie_word_embeddings: bool = False
+    hidden_act: str = "silu"
+    norm_topk_prob: bool = False
+    routed_scaling_factor: float = 1.0
+    rope_scaling: Optional[dict] = None
+    attention_dropout: float = 0.0
+
+    def __post_init__(self):
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size {self.hidden_size} must be divisible by "
+                f"num_attention_heads {self.num_attention_heads}"
+            )
+        if self.n_routed_experts <= 0:
+            raise ValueError("n_routed_experts must be positive")
+
+    @classmethod
+    def from_dict(cls, kwargs):
+        params = dict(kwargs)
+        valid_keys = set(cls.__dataclass_fields__)
+        params = {key: value for key, value in params.items() if key in valid_keys}
+        return cls(**params)
+
+    @classmethod
+    def from_pretrained(cls, model_path):
+        config_path = Path(model_path) / "config.json"
+        with config_path.open("r", encoding="utf-8") as f:
+            return cls.from_dict(json.load(f))
 
 
-__all__ = ["DeepseekMoeConfig"]
+DeepseekMoeConfig = DeepseekConfig
+
+__all__ = ["DeepseekConfig", "DeepseekMoeConfig"]

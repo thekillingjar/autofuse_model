@@ -1,387 +1,294 @@
 # coding=utf-8
-"""Standalone standard-PyTorch DeepSeek-MoE 16B.
-
-This reference intentionally avoids the repository executor, module package,
-torch_npu fused operators, and custom MoE kernels. It is intended for comparing
-plain eager execution with torch.compile + AutoFuse.
-"""
+"""Standalone standard-PyTorch DeepSeek-MoE 16B model."""
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
 
-from .configuration_deepseek_moe_16b import DeepseekMoeConfig
+from .configuration_deepseek_moe_16b import DeepseekConfig, DeepseekMoeConfig
 
 
-def rms_norm(x, weight, eps):
-    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
-
-
-def make_causal_mask(batch, seq_len, device, dtype):
-    mask = torch.full(
-        (seq_len, seq_len),
-        torch.finfo(dtype).min,
-        device=device,
-        dtype=dtype,
-    )
-    return torch.triu(mask, diagonal=1).view(1, 1, seq_len, seq_len).expand(
-        batch,
-        1,
-        seq_len,
-        seq_len,
-    )
-
-
-class DeepseekMoeRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps):
+class DeepseekRMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
-        return rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
 
 
-class DeepseekMoeRotaryEmbedding(nn.Module):
-    def __init__(self, config):
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class DeepseekRotaryEmbedding(nn.Module):
+    def __init__(self, config: DeepseekConfig):
         super().__init__()
-        inv_freq = 1.0 / (
-            config.rope_theta
-            ** (torch.arange(0, config.head_dim, 2).float() / config.head_dim)
-        )
+        self.config = config
+        dim = config.hidden_size // config.num_attention_heads
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, position_ids, dtype):
-        freqs = torch.einsum("bs,d->bsd", position_ids.float(), self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos().to(dtype).unsqueeze(1), emb.sin().to(dtype).unsqueeze(1)
+    def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor):
+        freqs = positions[..., None].float() * self.inv_freq.to(q.device)
+        cos = freqs.cos().to(q.dtype)
+        sin = freqs.sin().to(q.dtype)
+        cos = cos.repeat_interleave(2, dim=-1)
+        sin = sin.repeat_interleave(2, dim=-1)
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+
+        q_embed = (q * cos) + (_rotate_half(q.float()).to(q.dtype) * sin)
+        k_embed = (k * cos) + (_rotate_half(k.float()).to(k.dtype) * sin)
+        return q_embed, k_embed
 
 
-class DeepseekMoeMLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
+class DeepseekMLP(nn.Module):
+    def __init__(
+        self,
+        config: DeepseekConfig,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+    ):
         super().__init__()
+        hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=config.mlp_bias)
+        self.act_fn = F.silu
 
-    def forward(self, hidden_states):
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class MoEGate(nn.Module):
-    def __init__(self, config):
+class DeepseekMoEGate(nn.Module):
+    def __init__(self, config: DeepseekConfig):
         super().__init__()
-        self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.scoring_func = config.scoring_func
+        self.hidden_size = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.n_routed_experts, self.hidden_size))
         self.norm_topk_prob = config.norm_topk_prob
-        self.weight = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.hidden_size)
-        )
+        self.routed_scaling_factor = config.routed_scaling_factor
 
-    def forward(self, hidden_states):
-        logits = F.linear(hidden_states.float(), self.weight.float())
-        if self.scoring_func == "softmax":
-            scores = logits.softmax(dim=-1)
-        else:
-            raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
-        topk_weight, topk_idx = torch.topk(
-            scores,
-            k=self.top_k,
-            dim=-1,
-            sorted=False,
-        )
-        if self.top_k > 1 and self.norm_topk_prob:
-            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
-        topk_weight = topk_weight * self.routed_scaling_factor
-        return topk_idx, topk_weight.to(hidden_states.dtype)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = hidden_states.view(-1, self.hidden_size).float()
+        return F.linear(x, self.weight)
 
 
-class DeepseekMoeSparseMoeBlock(nn.Module):
-    def __init__(self, config):
+class DeepseekMoE(nn.Module):
+    def __init__(self, config: DeepseekConfig):
         super().__init__()
-        self.gate = MoEGate(config)
+        self.config = config
+        self.n_routed_experts = config.n_routed_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+
         self.experts = nn.ModuleList(
             [
-                DeepseekMoeMLP(config, intermediate_size=config.moe_intermediate_size)
-                for _ in range(config.n_routed_experts)
+                DeepseekMLP(config, intermediate_size=config.moe_intermediate_size)
+                for _ in range(self.n_routed_experts)
             ]
         )
-        self.shared_experts = None
-        if config.n_shared_experts is not None and config.n_shared_experts > 0:
-            self.shared_experts = DeepseekMoeMLP(
-                config,
-                intermediate_size=config.moe_intermediate_size
-                * config.n_shared_experts,
-            )
+        self.gate = DeepseekMoEGate(config)
+        shared_intermediate = config.moe_intermediate_size * config.n_shared_experts
+        self.shared_experts = DeepseekMLP(config, intermediate_size=shared_intermediate)
 
-    def _grouped_experts(self, hidden_states, tokens_per_expert):
-        """Run all routed experts through NPU grouped matmul kernels."""
-        try:
-            import torch_npu
-        except ImportError as exc:
-            raise RuntimeError("Dynamic MoE execution requires torch_npu") from exc
+    def forward(self, hidden_states: torch.Tensor):
+        orig_shape = hidden_states.shape
+        flat_hidden = hidden_states.reshape(-1, self.config.hidden_size)
 
-        gate_up_weight = torch.stack(
-            [torch.cat((expert.gate_proj.weight, expert.up_proj.weight), dim=0)
-             for expert in self.experts],
-            dim=0,
-        ).transpose(1, 2).contiguous()
-        down_weight = torch.stack(
-            [expert.down_proj.weight for expert in self.experts],
-            dim=0,
-        ).transpose(1, 2).contiguous()
-        gate_up = torch_npu.npu_grouped_matmul(
-            [hidden_states],
-            [gate_up_weight],
-            group_list=tokens_per_expert,
-            split_item=3,
-            group_type=0,
-            group_list_type=1,
-            output_dtype=hidden_states.dtype,
-            tuning_config=[0],
-        )[0]
-        intermediate_size = self.experts[0].gate_proj.out_features
-        gate, up = gate_up.split(intermediate_size, dim=-1)
-        activated = F.silu(gate) * up
-        return torch_npu.npu_grouped_matmul(
-            [activated],
-            [down_weight],
-            group_list=tokens_per_expert,
-            split_item=3,
-            group_type=0,
-            group_list_type=1,
-            output_dtype=hidden_states.dtype,
-            tuning_config=[0],
-        )[0]
-
-    def forward(self, hidden_states):
-        original_shape = hidden_states.shape
-        flat_states = hidden_states.reshape(-1, original_shape[-1])
-        topk_idx, topk_weight = self.gate(flat_states)
-        import torch_npu
-
-        expanded_states, expanded_row_idx, tokens_per_expert, _ = (
-            torch_npu.npu_moe_init_routing_v2(
-                flat_states,
-                expert_idx=topk_idx.to(torch.int32),
-                active_num=topk_idx.shape[0] * topk_idx.shape[1],
-                expert_num=self.gate.n_routed_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[0, self.gate.n_routed_experts],
-                quant_mode=-1,
-            )
+        logits = self.gate(flat_hidden)
+        weights = logits.softmax(dim=-1, dtype=torch.float32)
+        topk_weight, topk_idx = torch.topk(
+            weights, k=self.num_experts_per_tok, dim=-1, sorted=False
         )
-        expert_output = self._grouped_experts(expanded_states, tokens_per_expert)
-        output = torch_npu.npu_moe_finalize_routing(
-            expert_output,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weight.to(expert_output.dtype),
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=None,
-            drop_pad_mode=2,
-        )
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(flat_states)
-        return output.reshape(original_shape)
+        if self.norm_topk_prob:
+            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+        topk_weight = topk_weight * self.routed_scaling_factor
+        topk_weight = topk_weight.to(flat_hidden.dtype)
+
+        routed = torch.zeros_like(flat_hidden)
+        for i, expert in enumerate(self.experts):
+            mask = topk_idx == i
+            if not mask.any():
+                continue
+            flat_idx = mask.nonzero(as_tuple=True)[0]
+            expert_out = expert(flat_hidden[flat_idx])
+            w = topk_weight[mask].unsqueeze(-1)
+            routed.index_add_(0, flat_idx, (expert_out * w).to(routed.dtype))
+
+        out = routed.reshape(orig_shape) + self.shared_experts(hidden_states)
+        return out, logits
 
 
-class DeepseekMoeAttention(nn.Module):
-    def __init__(self, config):
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv, slen, head_dim = hidden_states.shape
+    return (
+        hidden_states[:, :, None, :, :]
+        .expand(batch, num_kv, n_rep, slen, head_dim)
+        .reshape(batch, num_kv * n_rep, slen, head_dim)
+    )
+
+
+class DeepseekAttention(nn.Module):
+    def __init__(self, config: DeepseekConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
+        self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.head_dim = config.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** (-0.5)
+        self.attention_dropout = config.attention_dropout
 
-    def forward(self, hidden_states, cos, sin, attention_mask):
-        batch, seq_len, _ = hidden_states.shape
-        query = self.q_proj(hidden_states).view(
-            batch,
-            seq_len,
-            self.num_heads,
-            self.head_dim,
-        ).transpose(1, 2)
-        key = self.k_proj(hidden_states).view(
-            batch,
-            seq_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ).transpose(1, 2)
-        value = self.v_proj(hidden_states).view(
-            batch,
-            seq_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ).transpose(1, 2)
-        query, key = apply_rotary_pos_emb(query, key, cos, sin)
-        if self.num_key_value_groups > 1:
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
-        scores = scores + attention_mask
-        weights = F.softmax(scores.float(), dim=-1).to(query.dtype)
-        output = torch.matmul(weights, value)
-        output = output.transpose(1, 2).reshape(batch, seq_len, -1)
-        return self.o_proj(output)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekRotaryEmbedding,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
+
+        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        q, k = rotary_emb(q, k, position_ids)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        k = _repeat_kv(k, self.num_kv_groups)
+        v = _repeat_kv(v, self.num_kv_groups)
+
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        return self.o_proj(attn_output)
 
 
-class DeepseekMoeDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx):
+class DeepseekDecoderLayer(nn.Module):
+    def __init__(self, config: DeepseekConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekMoeAttention(config)
-        self.mlp = (
-            DeepseekMoeMLP(config)
-            if layer_idx < config.first_k_dense_replace
-            else DeepseekMoeSparseMoeBlock(config)
-        )
-        self.input_layernorm = DeepseekMoeRMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-        )
-        self.post_attention_layernorm = DeepseekMoeRMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-        )
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
 
-    def forward(self, hidden_states, cos, sin, attention_mask):
+        self.input_layernorm = DeepseekRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.attention = DeepseekAttention(config, layer_idx)
+        self.post_attention_layernorm = DeepseekRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        if layer_idx < config.first_k_dense_replace:
+            self.mlp = DeepseekMLP(config)
+        else:
+            self.mlp = DeepseekMoE(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekRotaryEmbedding,
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cos, sin, attention_mask)
+        hidden_states = self.attention(hidden_states, attention_mask, position_ids, rotary_emb)
         hidden_states = residual + hidden_states
+
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
-class DeepseekMoePreTrainedModel(PreTrainedModel):
-    config_class = DeepseekMoeConfig
-    base_model_prefix = "model"
-    _no_split_modules = ["DeepseekMoeDecoderLayer"]
-
-
-class DeepseekMoeModel(DeepseekMoePreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-        )
+class DeepseekModel(nn.Module):
+    def __init__(self, config: DeepseekConfig):
+        super().__init__()
+        self.config = config
+        self.padding_idx = 0
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
         self.layers = nn.ModuleList(
-            [DeepseekMoeDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            [DeepseekDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepseekMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = DeepseekMoeRotaryEmbedding(config)
-        self.post_init()
+        self.norm = DeepseekRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.rotary_emb = DeepseekRotaryEmbedding(config)
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None, **kwargs):
+    def _make_causal_mask(self, x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        seq_len = x.size(1)
+        mask = torch.full((seq_len, seq_len), float("-inf"), device=x.device)
+        mask = torch.triu(mask, diagonal=1)
+        return mask[None, None, :, :].to(dtype)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len = input_ids.shape
         hidden_states = self.embed_tokens(input_ids)
-        batch, seq_len, _ = hidden_states.shape
-        if position_ids is None:
-            position_ids = torch.arange(
-                seq_len,
-                device=hidden_states.device,
-            ).view(1, -1).expand(batch, -1)
-        if attention_mask is None:
-            attention_mask = make_causal_mask(
-                batch,
-                seq_len,
-                hidden_states.device,
-                hidden_states.dtype,
-            )
-        elif attention_mask.ndim == 2:
-            padding_mask = (
-                1.0 - attention_mask.to(hidden_states.dtype)
-            )[:, None, None, :]
-            attention_mask = padding_mask * torch.finfo(hidden_states.dtype).min
-            attention_mask = attention_mask + make_causal_mask(
-                batch,
-                seq_len,
-                hidden_states.device,
-                hidden_states.dtype,
-            )
-        cos, sin = self.rotary_emb(position_ids, hidden_states.dtype)
+        position_ids = torch.arange(seq_len, device=input_ids.device).expand(bsz, -1)
+        attention_mask = self._make_causal_mask(input_ids, hidden_states.dtype)
+
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cos, sin, attention_mask)
-        return BaseModelOutputWithPast(
-            last_hidden_state=self.norm(hidden_states),
-            past_key_values=None,
-        )
+            hidden_states = layer(hidden_states, attention_mask, position_ids, self.rotary_emb)
+        return self.norm(hidden_states)
 
 
-class DeepseekMoeForCausalLM(DeepseekMoePreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = DeepseekMoeModel(config)
+class DeepseekForCausalLM(nn.Module):
+    def __init__(self, config: DeepseekConfig):
+        super().__init__()
+        self._config = config
+        self.model = DeepseekModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.vocab_size = config.vocab_size
-        self.post_init()
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None, **kwargs):
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
-        return CausalLMOutputWithPast(
-            logits=self.lm_head(outputs.last_hidden_state),
-            past_key_values=None,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+    @property
+    def config(self) -> DeepseekConfig:
+        return self._config
 
+    @config.setter
+    def config(self, value):
+        self._config = value
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = self.model(input_ids)
+        return self.lm_head(hidden_states)
+
+
+DeepseekMoeForCausalLM = DeepseekForCausalLM
+DeepseekMoeModel = DeepseekModel
 
 __all__ = [
+    "DeepseekConfig",
     "DeepseekMoeConfig",
+    "DeepseekForCausalLM",
     "DeepseekMoeForCausalLM",
+    "DeepseekModel",
     "DeepseekMoeModel",
 ]

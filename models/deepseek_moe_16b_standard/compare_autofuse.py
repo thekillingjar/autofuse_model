@@ -7,7 +7,6 @@ import argparse
 import time
 
 import torch
-from transformers import AutoTokenizer
 
 from .configuration_deepseek_moe_16b import DeepseekMoeConfig
 from .modeling_deepseek_moe_16b import DeepseekMoeForCausalLM
@@ -46,16 +45,10 @@ def main():
 
     if not torch.npu.is_available():
         raise RuntimeError("torch.npu is unavailable")
-    AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     config = DeepseekMoeConfig.from_pretrained(args.model_path)
     if args.num_hidden_layers is not None:
         config.num_hidden_layers = args.num_hidden_layers
-    model = DeepseekMoeForCausalLM.from_pretrained(
-        args.model_path,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).eval().to("npu")
+    model = DeepseekMoeForCausalLM(config).eval().to(torch.bfloat16).to("npu")
     model = compile_model(model, args.mode)
     input_ids = torch.randint(
         0,
