@@ -37,7 +37,7 @@ class AFN(nn.Module):
         emb = self.embed(feature_ids)
         log_emb = torch.log(torch.clamp(torch.abs(emb), min=1e-6))
         lnn = self.log_transform(log_emb.transpose(1, 2)).transpose(1, 2)
-        lnn = torch.exp(lnn).mean(dim=1)
+        lnn = torch.exp(lnn).mean(dim=-1)
         deep = self.deep(emb.flatten(1))
         return self.out(torch.cat([lnn, deep], dim=-1))
 
