@@ -25,7 +25,13 @@ def compile_model(model, mode):
 
 
 def make_inputs(model_type: str, batch_size: int, device: str):
-    if model_type in ("afn", "esmm"):
+    if model_type == "afn":
+        field_size = 39
+        seq_len = field_size
+        feat_ids = torch.randint(0, 32, (batch_size, seq_len)).to(device)
+        feat_vals = torch.rand((batch_size, seq_len)).to(device)
+        return feat_vals, feat_ids
+    if model_type == "esmm":
         return (torch.randint(0, 10000, (batch_size, 20), dtype=torch.long, device=device),)
     if model_type == "dien":
         history = torch.randint(0, 10000, (batch_size, 64), dtype=torch.long, device=device)

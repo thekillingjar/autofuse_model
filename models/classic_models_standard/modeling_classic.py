@@ -8,7 +8,8 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from deepctr_torch.inputs import SparseFeat, DenseFeat
+from deepctr_torch.models import AFN
 
 class MLP(nn.Module):
     def __init__(self, dims: list[int], activation: Callable[[torch.Tensor], torch.Tensor] = F.relu):
@@ -22,25 +23,57 @@ class MLP(nn.Module):
         return self.layers[-1](x)
 
 
-class AFN(nn.Module):
+class AFNmodel(nn.Module):
     """Adaptive Factorization Network style CTR model."""
 
-    def __init__(self, num_fields: int = 20, vocab_size: int = 10000, embed_dim: int = 16, hidden_dim: int = 256):
+    def __init__(self, field_size: int = 39, vocab_size: int = 2100000, embed_dim: int = 128, hidden_dim: int = 256):
         super().__init__()
-        self.num_fields = num_fields
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.log_transform = nn.Linear(num_fields, hidden_dim)
-        self.deep = MLP([num_fields * embed_dim, hidden_dim, hidden_dim, 1])
-        self.out = nn.Linear(hidden_dim + 1, 1)
+        self.device = "npu"
+        self.field_size = field_size
+        self.embed_dim = embed_dim
+        self.hash_space = vocab_size
+        self.dense_cols = [f"I{i}" for i in range(1, 14)]  # I1~I13
+        self.sparse_cols = [f"C{i}" for i in range(1, 27)]  # C1~C26
 
-    def forward(self, feature_ids: torch.Tensor) -> torch.Tensor:
-        emb = self.embed(feature_ids)
-        log_emb = torch.log(torch.clamp(torch.abs(emb), min=1e-6))
-        lnn = self.log_transform(log_emb.transpose(1, 2)).transpose(1, 2)
-        lnn = torch.exp(lnn).mean(dim=-1)
-        deep = self.deep(emb.flatten(1))
-        return self.out(torch.cat([lnn, deep], dim=-1))
+        dense_feats = [DenseFeat(c, 1) for c in self.dense_cols]
+        sparse_feats = [
+            SparseFeat(
+                c,
+                vocabulary_size=self.hash_space,
+                embedding_dim=self.embed_dim,
+                use_hash=False,
+            )
+            for c in self.sparse_cols
+        ]
+        self.feature_columns = dense_feats + sparse_feats
+        self.model = AFN(
+            linear_feature_columns=self.feature_columns,
+            dnn_feature_columns=self.feature_columns,
+            # afn_hidden_units=afn_hidden_units,
+            # dnn_hidden_units=dnn_hidden_units,
+            # dnn_dropout=0.2,
+            l2_reg_linear=1e-5,
+            l2_reg_embedding=1e-5,
+            task="binary",
+            device=self.device,
+            seed=2024,
+        )
 
+        self.criterion = nn.BCELoss()
+
+    def forward(self, feature_vals, feature_ids) -> torch.Tensor:
+        feature_vals = torch.reshape(feature_vals, (-1, self.field_size)).to(torch.float32)
+        feature_ids = torch.reshape(feature_vals, (-1, self.field_size)).to(torch.long)
+        dense_tensor = feature_vals[:, :13]
+        sparse_tensor = feature_ids[:, -26:]
+        B = dense_tensor.size(0)
+
+        X_mat = torch.zeros(B, 13 + 26, dtype=torch.float32, device=dense_tensor.device)
+        X_mat[:, :13] = dense_tensor
+        X_mat[:, 13:] = sparse_tensor.to(torch.float32)
+
+        preds = self.model(X_mat).squeeze(1)
+        return {"ctr": preds}
 
 class ESMM(nn.Module):
     """Entire Space Multi-task Model for CTR/CVR."""
@@ -171,7 +204,7 @@ class SAM(nn.Module):
 
 
 MODEL_BUILDERS: dict[str, Callable[[], nn.Module]] = {
-    "afn": AFN,
+    "afn": AFNmodel,
     "esmm": ESMM,
     "dien": DIEN,
     "decision_transformer": DecisionTransformer,
