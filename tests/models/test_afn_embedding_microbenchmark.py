@@ -1,5 +1,6 @@
 """CPU semantic and harness checks for the isolated AFN lookup reproducer."""
 
+import warnings
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -134,6 +135,7 @@ def test_profile_schedule_and_metrics(tmp_path):
         profiler_level=api.ProfilerLevel.Level1,
         aic_metrics=api.AiCMetrics.PipeUtilization,
         export_type=api.ExportType.Text,
+        data_simplification=False,
     )
     assert model.call_count == 13
     assert api.profile.return_value.__enter__.return_value.step.call_count == 13
@@ -142,5 +144,60 @@ def test_profile_schedule_and_metrics(tmp_path):
 
 
 def test_missing_profile_is_reported(tmp_path):
-    with pytest.warns(UserWarning, match="No ASCEND_PROFILER_OUTPUT"):
+    with pytest.warns(UserWarning) as caught:
+        inspect_profile(tmp_path)
+    messages = [str(item.message) for item in caught]
+    assert any("No ASCEND_PROFILER_OUTPUT" in message for message in messages)
+    assert any("No mindstudio_profiler_output" in message for message in messages)
+
+
+def make_framework_profile(tmp_path):
+    output = tmp_path / "worker_ascend_pt" / "ASCEND_PROFILER_OUTPUT"
+    output.mkdir(parents=True)
+    for name in (
+        "kernel_details.csv",
+        "op_statistic.csv",
+        "api_statistic.csv",
+        "step_trace_time.csv",
+    ):
+        (output / name).write_text("name,time\nop,1\n", encoding="utf-8")
+    (output / "trace_view.json").write_text("[]", encoding="utf-8")
+
+
+def test_profile_reports_retained_cann_exports(tmp_path, capsys):
+    make_framework_profile(tmp_path)
+    output = tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    for name in ("op_summary_0_1.csv", "op_statistic_0_1.csv"):
+        (output / name).write_text("\ufeffname,time\nop,1\n", encoding="utf-8")
+    timeline = output / "msprof_0_1.json"
+    timeline.write_text("[]", encoding="utf-8")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inspect_profile(tmp_path)
+    assert not caught
+    text = capsys.readouterr().out
+    assert f"cann_profile_output={output}" in text
+    assert "op_summary_0_1.csv: columns=2, has_rows=True" in text
+    assert f"cann_timeline={timeline}" in text
+    assert "trace_view.json: valid" in text
+
+
+def test_framework_exports_do_not_hide_missing_cann_exports(tmp_path, capsys):
+    make_framework_profile(tmp_path)
+    log = tmp_path / "worker_ascend_pt" / "profiler.log"
+    log.write_text("CANN export failed\n", encoding="utf-8")
+    with pytest.warns(UserWarning, match="No mindstudio_profiler_output"):
+        inspect_profile(tmp_path)
+    assert f"profile_log={log}" in capsys.readouterr().out
+
+
+def test_missing_or_empty_cann_summary_is_reported(tmp_path):
+    make_framework_profile(tmp_path)
+    output = tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    with pytest.warns(UserWarning, match=r"No op_summary\*\.csv"):
+        inspect_profile(tmp_path)
+    (output / "op_summary_0.csv").write_text("name,time\n", encoding="utf-8")
+    with pytest.warns(UserWarning, match="Empty profiler table"):
         inspect_profile(tmp_path)

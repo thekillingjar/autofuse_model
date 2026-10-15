@@ -102,13 +102,47 @@ Unprofiled timings for both modes finish BEFORE either profiling pass.
 CPU + NPU profiling uses Level1 + PipeUtilization, record_shapes=True, an
 explicit schedule, and one `prof.step()` per forward. Compilation and warmup
 finish before capture. Eager and AF traces are exported to separate directories.
+Text export and `data_simplification=False` explicitly retain CANN's parsed
+reports and parser logs, in addition to the framework's merged reports. This
+uses more disk space than the default simplified export.
 `--with-stack` adds CPU call stacks, with extra profiling overhead. Do not wrap
 this command in an external msprof collection at the same time.
 
-The script reports the generated profile path, CSV column counts and whether
-tables contain data, and checks that trace_view.json parses. Missing exports
-produce warnings. Target versions may differ in exported fields; inspect the
-actual artifacts and parser logs, not only the presence of an output directory.
+The script prints `profile_dir` before capture and `cann_profile_output` after
+parsing. Typical output layout (worker names and filenames vary by version):
+
+```text
+prof_lookup/slice_cast_embedding_<mode>_<timestamp>/
+  <worker>_ascend_pt/
+    ASCEND_PROFILER_OUTPUT/
+      kernel_details.csv
+      trace_view.json
+    PROF_<id>/
+      mindstudio_profiler_output/
+        op_summary*.csv
+        op_statistic*.csv
+        msprof*.json
+```
+
+`ASCEND_PROFILER_OUTPUT` is not `mindstudio_profiler_output`. The latter is
+CANN's export containing `op_summary*.csv` for the Task Wait Time analysis.
+In the official Ascend/pytorch v2.8.0 source, `torch_npu/profiler/experimental_config.py`
+defaults `data_simplification=True`, and
+`torch_npu/profiler/analysis/_profiling_parser.py::ProfilingParser.simplify_data`
+then removes `mindstudio_profiler_output` after analysis. This explains why
+the old script could retain framework reports without retaining CANN reports.
+
+The script checks both directories, reports CSV column counts and whether
+tables contain data, and checks that trace_view.json parses. Missing CANN
+exports or op_summary tables produce explicit warnings. Re-run capture after
+updating; the change does not restore previously deleted files.
+
+If CANN reports are still missing, inspect the printed `profile_log` paths and
+check `command -v msprof` in the same environment. The official
+`torch_npu/profiler/analysis/prof_view/cann_parse/_cann_export.py::CANNExportParser`
+uses `msprof --export=on --output=<PROF directory>` for Text export; keeping
+data does not fix an unavailable msprof or a failed parser. Do not assume a
+missing directory means collection itself failed.
 
 Compare the Slice/Cast/Embedding host dispatch, device durations, stream gaps,
 and per-forward task count. If this minimal case is slow under AF, it narrows

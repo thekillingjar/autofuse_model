@@ -51,8 +51,40 @@ def benchmark(model, inputs, device, warmup, steps):
     return first_ms, (time.perf_counter() - start) * 1000 / steps
 
 
+def inspect_csv(path):
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, [])
+        has_rows = next(reader, None) is not None
+    print(f"{path}: columns={len(header)}, has_rows={has_rows}", flush=True)
+    if not has_rows:
+        warnings.warn(f"Empty profiler table: {path}", stacklevel=2)
+
+
 def inspect_profile(directory):
-    """Report export problems instead of silently accepting an empty profile."""
+    """Check framework exports and the retained CANN exports separately."""
+    cann_outputs = sorted(directory.rglob("mindstudio_profiler_output"))
+    if not cann_outputs:
+        warnings.warn(
+            f"No mindstudio_profiler_output found under {directory}. "
+            "data_simplification=False is required to retain CANN exports. "
+            "If already disabled, check the profiler parser logs and that "
+            "CANN's msprof is available on PATH.",
+            stacklevel=2,
+        )
+    for output in cann_outputs:
+        print(f"cann_profile_output={output}", flush=True)
+        summaries = sorted(output.glob("op_summary*.csv"))
+        if not summaries:
+            warnings.warn(f"No op_summary*.csv found in {output}", stacklevel=2)
+        for path in summaries + sorted(output.glob("op_statistic*.csv")):
+            inspect_csv(path)
+        for path in sorted(output.glob("msprof*.json")):
+            print(f"cann_timeline={path}", flush=True)
+    if not cann_outputs:
+        for path in sorted(directory.rglob("*.log")):
+            print(f"profile_log={path}", flush=True)
+
     outputs = list(directory.rglob("ASCEND_PROFILER_OUTPUT"))
     if not outputs:
         warnings.warn(
@@ -70,13 +102,7 @@ def inspect_profile(directory):
             if not path.exists():
                 warnings.warn(f"Missing profiler artifact: {path}", stacklevel=2)
                 continue
-            with path.open(newline="", encoding="utf-8-sig") as handle:
-                reader = csv.reader(handle)
-                header = next(reader, [])
-                has_rows = next(reader, None) is not None
-            print(f"{name}: columns={len(header)}, has_rows={has_rows}", flush=True)
-            if not has_rows:
-                warnings.warn(f"Empty profiler table: {path}", stacklevel=2)
+            inspect_csv(path)
         trace = output / "trace_view.json"
         if not trace.exists():
             warnings.warn(f"Missing profiler artifact: {trace}", stacklevel=2)
@@ -94,10 +120,13 @@ def collect_profile(model, inputs, args, mode):
         Path(args.profile_dir).resolve() / f"{args.case}_{mode}_{time.time_ns()}"
     )
     directory.mkdir(parents=True)
+    print(f"profile_dir={directory}, data_simplification=False", flush=True)
     experimental = torch_npu.profiler._ExperimentalConfig(
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
         export_type=torch_npu.profiler.ExportType.Text,
+        # Otherwise torch_npu removes mindstudio_profiler_output after parsing.
+        data_simplification=False,
     )
     # Compilation already happened in benchmark(); profile only steady-state calls.
     with torch_npu.profiler.profile(

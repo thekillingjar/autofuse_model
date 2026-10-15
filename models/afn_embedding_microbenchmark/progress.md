@@ -26,3 +26,27 @@
   to this standalone model directory and its focused CPU test file.
 - No local NPU test, AutoFuse performance claim, or root-cause conclusion.
   Inplace packing/copy is intentionally excluded from this first reproducer.
+
+## CANN report retention fix (2026-10-15)
+
+- User reports no mindstudio_profiler_output. The script previously enabled
+  Text export but left data_simplification at the package default and checked
+  only ASCEND_PROFILER_OUTPUT.
+- Verified official Ascend/pytorch tag v2.8.0 source:
+  torch_npu/profiler/experimental_config.py defaults data_simplification=True;
+  analysis/_profiling_parser.py::ProfilingParser.simplify_data explicitly
+  removes mindstudio_profiler_output and mindstudio_profiler_log when True.
+  analysis/prof_view/cann_parse/_cann_export.py invokes msprof for Text export.
+- Explicitly disable simplification. Report the capture path, retained CANN
+  export directories, version-suffixed op_summary/op_statistic CSVs and
+  msprof timelines. Warn separately when CANN reports are missing, even if
+  merged framework reports exist, and show available parser log paths.
+- No changes to model, compilation options, schedule or latency measurement.
+  Target package versions and artifacts remain unavailable, so this fixes
+  the demonstrated retention issue but does not assert the target parser
+  will succeed. Local NPU export verification is unavailable.
+- Validation: 25 CPU tests passed, including the disabled simplification
+  option, nested/suffixed CANN exports, missing CANN exports despite valid
+  framework reports, and missing/empty op_summary warnings. Ruff and
+  git diff --check passed. Model-directory CPU eager smoke test passed with
+  PYTHONPATH set to the repository root and exact output checking.
