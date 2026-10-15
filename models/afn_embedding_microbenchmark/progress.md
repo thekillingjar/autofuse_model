@@ -1,0 +1,28 @@
+# Isolated AFN Sparse Lookup Reproducer
+
+- User request: isolate `embedding_dict[name](X[:, start:end].long())` to
+  investigate eager vs AutoFuse latency and large waits preceding short tasks.
+- Reference: current `models/classic_models_standard/modeling_classic.py`
+  declares 13 dense / 26 sparse fields, vocabulary 2100000, embedding dim 128;
+  classic compare script casts model weights to BF16. Actual target hardware,
+  package versions, and profiler artifacts were not provided.
+- Implementation: standalone standard PyTorch model, no DeepCTR dependency or
+  existing AFN modification. Return all per-field outputs so no unused lookup
+  can be removed from the graph. Cases isolate Slice+Cast+Embedding,
+  Cast+Embedding, Embedding alone, and Slice+Cast.
+- Defaults: batch 128, one field at offset 13 of 39, vocabulary 10000 for a
+  small test, sampled IDs [0, 32), embedding dim 128, BF16 weights, FP32 X.
+  Full AFN capacity is explicitly opt-in and no hardware capacity is assumed.
+- Timing uses the same weights/inputs across modes, excludes first forward,
+  warmup, output checking and profiling, and brackets the loop with sync.
+- Profiling is local to this standalone script (executor profiler not used).
+  Level1 + PipeUtilization, CPU/NPU, shapes, schedule and per-forward prof.step;
+  10 active forwards by default, after compile/warmup. Both latency passes
+  complete before either profile. Verify artifacts and warn on missing tables.
+- CPU PyTorch 2.8.0: all 22 tests passed, including profiler schedule / metrics
+  and missing-export checks. Eager CLI smoke test with batch 128 and 2 fields
+  passed with exact output checking. Model-directory CLI --help works.
+- Ruff check, compileall and git diff --check passed. Changes are confined
+  to this standalone model directory and its focused CPU test file.
+- No local NPU test, AutoFuse performance claim, or root-cause conclusion.
+  Inplace packing/copy is intentionally excluded from this first reproducer.
