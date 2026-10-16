@@ -9,8 +9,9 @@ embedding_dict[name](X[:, start:end].long())
 For embedding cases, one independent table is allocated per selected field. The
 forward returns a tuple of per-field results, without concatenation, reduction,
 input packing, slice assignments, or downstream AFN layers. In particular,
-this does NOT reproduce `X_mat[:, ...] = ...` / inplace copy. A missing
-`InplaceCopy` kernel is expected and does not itself diagnose the original model.
+this does NOT reproduce `X_mat[:, ...] = ...`. The `.long()` conversion can
+still dispatch `copy_` / `aclnnInplaceCopy`; that API name alone does not imply
+an input slice assignment.
 
 ## Run
 
@@ -126,6 +127,53 @@ forward, warmup, output checks, and profiling. Synchronization brackets the
 whole timed loop, not each iteration; results include host dispatch and device
 execution. Do not subtract ablation timings as exact individual operator costs:
 removing an operation can also change fusion, layouts, and dispatch.
+
+## Runtime Cast Replacement
+
+To test whether the runtime `prims::convert_element_type` path adds Host
+overhead, run the baseline and replacement in separate processes:
+
+```bash
+python -m models.afn_embedding_microbenchmark.compare_autofuse \
+  --mode compare --case slice_cast_embedding --batch-size 128 --num-fields 26 \
+  --check-output --profile-dir ./prof_cast_default
+
+python -m models.afn_embedding_microbenchmark.compare_autofuse \
+  --mode compare --case slice_cast_embedding --batch-size 128 --num-fields 26 \
+  --prims-cast-to-copy --check-output --profile-dir ./prof_cast_to_copy
+```
+
+The switch registers a temporary `PrivateUse1` (NPU) dispatcher implementation:
+
+```python
+def convert_element_type_via_to_copy(tensor, dtype):
+    return torch.ops.aten._to_copy.default(tensor, dtype=dtype)
+```
+
+This replaces the real NPU runtime primitive, bypassing its default
+`meta check -> empty_like -> prims.copy_to` wrapper. It keeps an allocating
+conversion even for a matching dtype. Changing `.long()` to `.to(torch.int64)`
+in the model alone does not guarantee this result: compilation can decompose
+both expressions into the same primitive.
+
+The override stays active during AutoFuse compilation, warmup, timing, and
+profiling, and is removed afterwards. In `--mode compare`, eager remains the
+baseline and only the AutoFuse block uses the replacement. It leaves
+FakeTensor/meta registration and Inductor lowering unchanged. A cast already
+lowered into a generated kernel will not use this replacement. An existing
+NPU implementation for the primitive causes an explicit error rather than
+being overwritten. This is an inference diagnostic, not a general training
+patch or a guarantee of speedup.
+
+Compare the unprofiled `avg_forward_ms`, output checks, and correlated Host /
+Device events. In the replaced runtime path, expect `aten::_to_copy` instead
+of the primitive's nested `empty_like -> prims::copy_to`; the outer
+`prims::convert_element_type` event can remain because it is still dispatched.
+`aclnnInplaceCopy` and its internal Slice/Cast tasks may also remain. Verify
+their Host submission gaps and task wait times rather than expecting those
+Device kernels to disappear. CPU tests validate values, dtype, strides,
+non-aliasing, dispatch, and override cleanup; NPU performance must be measured
+on the target installation.
 
 ## Profile
 

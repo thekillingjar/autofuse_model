@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from .modeling_embedding import CASES, AFNEmbeddingLookup, prepare_input
+from .runtime_cast import use_to_copy_for_prims
 
 
 def compile_model(model, mode):
@@ -182,6 +183,11 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--check-output", action="store_true")
     parser.add_argument(
+        "--prims-cast-to-copy",
+        action="store_true",
+        help="Experiment: dispatch runtime NPU prims casts through aten._to_copy.",
+    )
+    parser.add_argument(
         "--profile-dir",
         help="Optionally collect an additional NPU profile, outside latency timing.",
     )
@@ -211,6 +217,8 @@ def parse_args(argv=None):
         parser.error("--profile-dir requires an NPU device")
     if args.device.startswith("cpu") and args.mode not in ("none", "eager"):
         parser.error("CPU smoke tests require --mode eager or none")
+    if args.prims_cast_to_copy and not args.device.startswith("npu"):
+        parser.error("--prims-cast-to-copy requires an NPU device")
     return args
 
 
@@ -219,6 +227,11 @@ def main():
     if args.device.startswith("npu"):
         import torch_npu  # noqa: F401
 
+    run(args)
+
+
+def run(args):
+    if args.device.startswith("npu"):
         if not torch.npu.is_available():
             raise RuntimeError("torch.npu is unavailable")
         torch.npu.set_device(args.device)
@@ -258,6 +271,10 @@ def main():
         flush=True,
     )
     print(
+        f"runtime_prims_cast={'aten._to_copy for autofuse only' if args.prims_cast_to_copy else 'default'}",
+        flush=True,
+    )
+    print(
         f"device={device}, weight_dtype={args.dtype}, input_dtype={x.dtype}, input_stride={x.stride()}",
         flush=True,
     )
@@ -278,20 +295,24 @@ def main():
             reference = tuple(value.cpu().clone() for value in model(inputs))
     timings = {}
     for mode in modes:
-        measured_model = compile_model(model, mode)
-        first_ms, avg_ms = benchmark(
-            measured_model, inputs, device, args.warmup, args.steps
-        )
+        replace_cast = args.prims_cast_to_copy and mode == "autofuse"
+        with use_to_copy_for_prims(replace_cast):
+            measured_model = compile_model(model, mode)
+            first_ms, avg_ms = benchmark(
+                measured_model, inputs, device, args.warmup, args.steps
+            )
+            if reference is not None:
+                with torch.inference_mode():
+                    outputs = measured_model(inputs)
+                    for actual, expected in zip(outputs, reference, strict=True):
+                        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         timings[mode] = avg_ms
         print(
-            f"mode={mode}, first_forward_ms={first_ms:.6f}, avg_forward_ms={avg_ms:.6f}",
+            f"mode={mode}, runtime_prims_cast={'aten._to_copy' if replace_cast else 'default'}, "
+            f"first_forward_ms={first_ms:.6f}, avg_forward_ms={avg_ms:.6f}",
             flush=True,
         )
         if reference is not None:
-            with torch.inference_mode():
-                outputs = measured_model(inputs)
-                for actual, expected in zip(outputs, reference, strict=True):
-                    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
             print(f"mode={mode}, output_check=passed", flush=True)
         del measured_model
     if args.mode == "compare":
@@ -299,9 +320,11 @@ def main():
     # Finish all unprofiled timings first so profiling eager cannot perturb AF timing.
     if args.profile_dir:
         for mode in modes:
-            measured_model = compile_model(model, mode)
-            benchmark(measured_model, inputs, device, args.warmup, 1)
-            collect_profile(measured_model, inputs, args, mode)
+            replace_cast = args.prims_cast_to_copy and mode == "autofuse"
+            with use_to_copy_for_prims(replace_cast):
+                measured_model = compile_model(model, mode)
+                benchmark(measured_model, inputs, device, args.warmup, 1)
+                collect_profile(measured_model, inputs, args, mode)
 
 
 if __name__ == "__main__":
