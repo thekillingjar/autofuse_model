@@ -36,9 +36,40 @@ def test_matches_original_expression(fields, case):
         actual, model.feature_index.items(), strict=True
     ):
         ids = x[:, start:end].long()
-        expected = ids if case == "slice_cast" else model.embedding_dict[name](ids)
+        if case in ("slice_only", "slice_copy"):
+            expected = x[:, start:end]
+        elif case == "slice_cast":
+            expected = ids
+        else:
+            expected = model.embedding_dict[name](ids)
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        assert result.shape == ((4, 1) if case == "slice_cast" else (4, 1, 8))
+        assert result.shape == (
+            (4, 1) if case in ("slice_cast", "slice_only", "slice_copy") else (4, 1, 8)
+        )
+        assert result.dtype == expected.dtype
+
+
+@pytest.mark.parametrize("case", ["slice_only", "slice_copy"])
+@pytest.mark.parametrize("batch_size", [1, 128])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_slice_cases_preserve_dtype_and_storage_contract(case, batch_size, dtype):
+    model = AFNEmbeddingLookup(num_fields=2, case=case)
+    x = torch.arange(batch_size * 39).reshape(batch_size, 39).to(dtype)
+    assert prepare_input(model, x) is x
+    assert not list(model.parameters())
+    for result, (start, end) in zip(
+        model(x), model.feature_index.values(), strict=True
+    ):
+        expected = x[:, start:end]
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        assert result.dtype == dtype
+        if case == "slice_only":
+            assert result.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+            assert result.stride() == expected.stride()
+            assert result.storage_offset() == expected.storage_offset()
+        else:
+            assert result.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+            assert result.is_contiguous()
 
 
 def test_ablations_keep_weights_and_output():
@@ -166,7 +197,9 @@ def make_framework_profile(tmp_path):
 
 def test_profile_reports_retained_cann_exports(tmp_path, capsys):
     make_framework_profile(tmp_path)
-    output = tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    output = (
+        tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    )
     output.mkdir(parents=True)
     for name in ("op_summary_0_1.csv", "op_statistic_0_1.csv"):
         (output / name).write_text("\ufeffname,time\nop,1\n", encoding="utf-8")
@@ -194,7 +227,9 @@ def test_framework_exports_do_not_hide_missing_cann_exports(tmp_path, capsys):
 
 def test_missing_or_empty_cann_summary_is_reported(tmp_path):
     make_framework_profile(tmp_path)
-    output = tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    output = (
+        tmp_path / "worker_ascend_pt" / "PROF_1_2_ABC" / "mindstudio_profiler_output"
+    )
     output.mkdir(parents=True)
     with pytest.warns(UserWarning, match=r"No op_summary\*\.csv"):
         inspect_profile(tmp_path)

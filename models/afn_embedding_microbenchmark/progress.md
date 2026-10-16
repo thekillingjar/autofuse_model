@@ -50,3 +50,27 @@
   framework reports, and missing/empty op_summary warnings. Ruff and
   git diff --check passed. Model-directory CPU eager smoke test passed with
   PYTHONPATH set to the repository root and exact output checking.
+
+## Slice-only comparison (2026-10-16)
+
+- Request: add an eager vs AutoFuse comparison containing only slice.
+- Extend the existing standalone harness instead of changing the full AFN or
+  executor. Keep the existing compile flags, timing and optional profiler.
+- slice_only returns X[:, start:end] without cast, embedding, copy or reduction.
+  CPU tests verify storage sharing and preserved strides/offsets; no Device
+  kernel is required, so do not claim this reproduces the SliceAiCore task.
+- Optional slice_copy clones each slice to contiguous storage; no cast or
+  embedding. This tests materialization separately, without promising a
+  particular ACLNN implementation. Both cases allocate no embedding tables.
+- Input defaults remain FP32 [128, 39], column offset 13, one selected field.
+  Actual target hardware/packages and NPU profile remain unverified locally.
+- Validation: 43 CPU tests passed with PyTorch 2.8.0, covering both new cases
+  at batch 1/128 and FP32/BF16/INT64, no parameters, shared vs independent
+  storage, exact values, and fullgraph capture. Both model-directory eager
+  CLI smoke tests passed with 26 fields and exact output checking. PYTHONPATH
+  must include the repository root, as shown in the README.
+- Pre-commit all-files check encountered existing repository formatting and
+  script-permission failures plus the master branch guard. Unrelated automatic
+  whitespace/EOF edits from this check were reverted; no baseline cleanup is
+  included. Run scoped hooks with only the branch guard skipped to publish the
+  requested commit on the existing tracked master branch.

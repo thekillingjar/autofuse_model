@@ -6,7 +6,7 @@ Isolate this expression without importing DeepCTR or the full AFN:
 embedding_dict[name](X[:, start:end].long())
 ```
 
-One independent embedding table is allocated for each selected field. The
+For embedding cases, one independent table is allocated per selected field. The
 forward returns a tuple of per-field results, without concatenation, reduction,
 input packing, slice assignments, or downstream AFN layers. In particular,
 this does NOT reproduce `X_mat[:, ...] = ...` / inplace copy. A missing
@@ -66,6 +66,8 @@ Choose one `--case` per run, retaining the other parameters:
 | `cast_embedding` | `.long()` then embedding | Pre-slice views; preserve their strides |
 | `embedding_only` | Embedding only | Pre-slice and convert to INT64 |
 | `slice_cast` | Slice and INT64 cast, no table | None |
+| `slice_only` | `X[:, start:end]` views only, no cast or table | None |
+| `slice_copy` | Slice then `clone(memory_format=torch.contiguous_format)` | None |
 
 ```bash
 python -m models.afn_embedding_microbenchmark.compare_autofuse \
@@ -77,6 +79,41 @@ python -m models.afn_embedding_microbenchmark.compare_autofuse \
 python -m models.afn_embedding_microbenchmark.compare_autofuse \
   --mode compare --case slice_cast --num-fields 26 --check-output
 ```
+
+### Slice Only
+
+Compare the exact `X[:, start:end]` expression, with no Cast, Embedding,
+concatenation, reduction or inplace assignment:
+
+```bash
+python -m models.afn_embedding_microbenchmark.compare_autofuse \
+  --mode compare --case slice_only --batch-size 128 --num-fields 1 \
+  --check-output --profile-dir ./prof_slice --profile-steps 10
+```
+
+The input remains FP32 `[128, 39]`, selecting column 13 by default. There
+are no model parameters for either slice case; `--dtype` only applies to
+embedding weights and does not change the input dtype. `--num-fields 26`
+returns 26 separate slices, without combining them.
+
+Basic slicing returns a view sharing input storage. This case can therefore
+run without a Device kernel; its latency primarily measures Host view creation
+and dispatch, not the duration of a `SliceAiCore_Slice` kernel. An empty Device
+profile or missing AutoFuse kernel is not, on its own, an error.
+
+To force a separate contiguous result for every slice, use the optional copy
+case. It still contains no Cast or Embedding, but is **not** a pure view test:
+
+```bash
+python -m models.afn_embedding_microbenchmark.compare_autofuse \
+  --mode compare --case slice_copy --batch-size 128 --num-fields 1 \
+  --check-output --profile-dir ./prof_slice_copy --profile-steps 10
+```
+
+`clone` copies even when the selected view is already contiguous (e.g. batch 1).
+The backend chooses the actual copy kernel; this does not guarantee an
+`aclnnInplaceCopy_SlicAiCore_Slice` kernel or reproduce AFN's inplace packing.
+Inspect the generated profile rather than inferring kernel names from the case.
 
 Within compare mode, eager and AutoFuse share the same weights and inputs.
 AutoFuse uses `backend="inductor"`, `dynamic=False`, `fullgraph=True`, and

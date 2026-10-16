@@ -1,4 +1,4 @@
-"""Measure AFN sparse lookup latency without the rest of the AFN network."""
+"""Compare eager/AutoFuse for AFN slicing and sparse lookup in isolation."""
 
 from __future__ import annotations
 
@@ -265,6 +265,12 @@ def main():
         f"vocab_size={args.vocab_size}, sampled_id_range={min(args.index_range, args.vocab_size)}, parameter_bytes={parameter_bytes}",
         flush=True,
     )
+    if args.case == "slice_only":
+        print(
+            "slice_only returns views: timing measures view/dispatch overhead; "
+            "a device kernel is not required. Use slice_copy to materialize outputs.",
+            flush=True,
+        )
     modes = ("eager", "autofuse") if args.mode == "compare" else (args.mode,)
     reference = None
     if args.check_output:

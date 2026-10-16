@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import torch
 from torch import nn
 
-CASES = ("slice_cast_embedding", "cast_embedding", "embedding_only", "slice_cast")
+CASES = (
+    "slice_cast_embedding",
+    "cast_embedding",
+    "embedding_only",
+    "slice_cast",
+    "slice_only",
+    "slice_copy",
+)
 
 
 class AFNEmbeddingLookup(nn.Module):
@@ -39,7 +47,7 @@ class AFNEmbeddingLookup(nn.Module):
                     for name in self.feature_index
                 }
             )
-            if case != "slice_cast"
+            if case in ("slice_cast_embedding", "cast_embedding", "embedding_only")
             else nn.ModuleDict()
         )
 
@@ -52,8 +60,12 @@ class AFNEmbeddingLookup(nn.Module):
                 output = self.embedding_dict[name](x[i].long())
             elif self.case == "embedding_only":
                 output = self.embedding_dict[name](x[i])
-            else:
+            elif self.case == "slice_cast":
                 output = x[:, start:end].long()
+            elif self.case == "slice_only":
+                output = x[:, start:end]
+            else:
+                output = x[:, start:end].clone(memory_format=torch.contiguous_format)
             outputs.append(output)
         # No cat/reduction: keep the same per-field outputs as DeepCTR lookup.
         return tuple(outputs)
@@ -61,7 +73,7 @@ class AFNEmbeddingLookup(nn.Module):
 
 def prepare_input(model, x):
     """Prepare ablation inputs outside the measured/compiled region."""
-    if model.case in ("slice_cast_embedding", "slice_cast"):
+    if model.case in ("slice_cast_embedding", "slice_cast", "slice_only", "slice_copy"):
         return x
     columns = tuple(x[:, start:end] for start, end in model.feature_index.values())
     if model.case == "embedding_only":
