@@ -251,7 +251,8 @@ class Gemma4Model(nn.Module):
     def _make_sliding_mask(self, input_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         seq_len = input_ids.size(1)
         causal = self._make_causal_mask(input_ids, dtype)
-        positions = torch.arange(seq_len, device=input_ids.device)
+        # Avoid INT64 broadcasts when AutoFuse builds pairwise distances.
+        positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.float32)
         distance = positions.view(-1, 1) - positions.view(1, -1)
         window_mask = distance >= self.config.sliding_window
         return causal + window_mask.view(1, 1, seq_len, seq_len).to(dtype) * torch.finfo(dtype).min
@@ -259,7 +260,8 @@ class Gemma4Model(nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch, seq_len = input_ids.shape
         hidden_states = self.embed_tokens(input_ids) * self.embed_scale
-        position_ids = torch.arange(seq_len, device=input_ids.device).view(1, -1).expand(batch, -1)
+        # RoPE consumes FP32 positions; cast before the batch broadcast.
+        position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.float32).view(1, -1).expand(batch, -1)
         attention_mask = self._make_causal_mask(input_ids, hidden_states.dtype)
         sliding_attention_mask = self._make_sliding_mask(input_ids, hidden_states.dtype)
         for layer in self.layers:
